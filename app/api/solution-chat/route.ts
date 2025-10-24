@@ -1,16 +1,35 @@
+// app/api/solution-chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
-import { SOLUTION_VOICE, REPLY_STYLE, SAFETY_GUARDRAILS, CTA_POLICY, REPLY_SCAFFOLD } from "@/lib/solutionPersona";
-import { SOLUTION_MODES, SOLUTION_SHARED_RULES, SolutionModeKey } from "@/lib/solutionModes";
+import {
+  SOLUTION_VOICE,
+  REPLY_STYLE,
+  SAFETY_GUARDRAILS,
+  CTA_POLICY,
+  REPLY_SCAFFOLD,
+} from "@/lib/solutionPersona";
+import {
+  SOLUTION_MODES,
+  SOLUTION_SHARED_RULES,
+  SolutionModeKey,
+} from "@/lib/solutionModes";
 
-export const runtime = "edge";
+// ▼ Edge ではなく Node.js で実行（タイムアウトに強い）
+export const runtime = "nodejs";
+// 任意：東京近傍を優先
+export const preferredRegion = ["hnd1"];
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL ?? "gpt-4o-mini";
 const ROUTER_MODEL = process.env.OPENAI_ROUTER_MODEL ?? "gpt-4o-mini";
 
 const MODE_LIST: SolutionModeKey[] = [
-  "executive","diagnostics","hr_enablement","facilitation","training","sales_light",
+  "executive",
+  "diagnostics",
+  "hr_enablement",
+  "facilitation",
+  "training",
+  "sales_light",
 ];
 
 const ROUTER_SYSTEM = `
@@ -27,78 +46,116 @@ const ROUTER_SYSTEM = `
 - 料金/納期/依頼/問い合わせ → sales_light
 `;
 
+// ▼ 汎用タイムアウトラッパー
+function withTimeout<T>(p: Promise<T>, ms: number, label = "request"): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms);
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
+
 export async function POST(req: NextRequest) {
-  const { messages } = await req.json();
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const lastUser = [...messages].reverse().find((m: any) => m.role === "user")?.content ?? "";
-
-  // 1) ルーティング
-  const route = await openai.chat.completions.create({
-    model: ROUTER_MODEL,
-    messages: [
-      { role: "system", content: ROUTER_SYSTEM },
-      { role: "user", content: String(lastUser).slice(0, 4000) },
-    ],
-    temperature: 0,
-    response_format: { type: "json_object" } as any,
-  });
-
-  let parsed: { mode: SolutionModeKey; confidence: number } = { mode: "executive", confidence: 0.5 };
   try {
-    parsed = JSON.parse(route.choices[0]?.message?.content || "{}");
-    if (!MODE_LIST.includes(parsed.mode)) parsed.mode = "executive";
-  } catch {}
+    const { messages } = await req.json();
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // 2) 人格（SME強化）＋モードを合体したSYSTEM
-  const SYSTEM = [
-    SOLUTION_VOICE,
-    REPLY_STYLE,
-    SAFETY_GUARDRAILS,
-    SOLUTION_SHARED_RULES,
-    SOLUTION_MODES[parsed.mode],
-    CTA_POLICY,
-    REPLY_SCAFFOLD,
-    `非表示メタ: 現在モード=${parsed.mode}。モード名は本文に出さない。`
-  ].join("\n");
+    const lastUser =
+      [...messages].reverse().find((m: any) => m.role === "user")?.content ?? "";
 
-  // 3) 返答生成
-  const chat = await openai.chat.completions.create({
-    model: CHAT_MODEL,
-    temperature: 0.7,
-    messages: [
-      { role: "system", content: SYSTEM },
-      ...messages.map((m: any) => ({ role: m.role, content: m.content })),
-    ],
-  });
+    // 1) ルーティング（短めタイムアウト）
+    const route = await withTimeout(
+      openai.chat.completions.create({
+        model: ROUTER_MODEL,
+        messages: [
+          { role: "system", content: ROUTER_SYSTEM },
+          { role: "user", content: String(lastUser).slice(0, 4000) },
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" } as any,
+      }),
+      4500,
+      "router"
+    );
 
-  // 4) 整形
-  let reply = chat.choices[0]?.message?.content ?? "";
-
-  function formatCorporate(t: string) {
-    t = t.replace(/^#{1,6}\s*/gm, "");
-    t = t.replace(/^\s*\d+[\)\.、]\s*/gm, "・ ");
-    t = t.replace(/^\s*[-*]\s+/gm, "・ ");
-    t = t.replace(/([。！？])(?=[^\n])/g, "$1\n");
-    t = t.replace(/\n{3,}/g, "\n\n");
-    if (t.length > 600) {
-      const chunks = t.match(/.{1,400}(?:\s|$)/g) || [t];
-      t = chunks.map(s => s.trim()).join("\n\n");
+    let parsed: { mode: SolutionModeKey; confidence: number } = {
+      mode: "executive",
+      confidence: 0.5,
+    };
+    try {
+      parsed = JSON.parse(route.choices[0]?.message?.content || "{}");
+      if (!MODE_LIST.includes(parsed.mode)) parsed.mode = "executive";
+    } catch {
+      // 解析失敗時は executive のまま
     }
-    t = t.split("\n").map(l => l.trimEnd()).join("\n");
-    return t.trim();
-  }
 
-  reply = formatCorporate(reply);
+    // 2) 人格（SME強化）＋モードを合体した SYSTEM
+    const SYSTEM = [
+      SOLUTION_VOICE,
+      REPLY_STYLE,
+      SAFETY_GUARDRAILS,
+      SOLUTION_SHARED_RULES,
+      SOLUTION_MODES[parsed.mode],
+      CTA_POLICY,
+      REPLY_SCAFFOLD,
+      `非表示メタ: 現在モード=${parsed.mode}。モード名は本文に出さない。`,
+    ].join("\n");
 
-  // 5) CTAトリガ
-  const needsContact = /(料金|費用|値段|価格|見積|詳細|導入|資料|相談|依頼|契約|価格表|金額)/.test(String(lastUser));
-  if (needsContact) {
-    reply += `
+    // 3) 返答生成（やや長めタイムアウト）
+    const chat = await withTimeout(
+      openai.chat.completions.create({
+        model: CHAT_MODEL,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: SYSTEM },
+          ...messages.map((m: any) => ({ role: m.role, content: m.content })),
+        ],
+      }),
+      15000,
+      "chat"
+    );
+
+    // 4) 整形
+    let reply = chat.choices[0]?.message?.content ?? "";
+
+    function formatCorporate(t: string) {
+      t = t.replace(/^#{1,6}\s*/gm, "");
+      t = t.replace(/^\s*\d+[\)\.、]\s*/gm, "・ ");
+      t = t.replace(/^\s*[-*]\s+/gm, "・ ");
+      t = t.replace(/([。！？])(?=[^\n])/g, "$1\n");
+      t = t.replace(/\n{3,}/g, "\n\n");
+      if (t.length > 600) {
+        const chunks = t.match(/.{1,400}(?:\s|$)/g) || [t];
+        t = chunks.map((s) => s.trim()).join("\n\n");
+      }
+      t = t.split("\n").map((l) => l.trimEnd()).join("\n");
+      return t.trim();
+    }
+
+    reply = formatCorporate(reply);
+
+    // 5) CTAトリガ
+    const needsContact = /(料金|費用|値段|価格|見積|詳細|導入|資料|相談|依頼|契約|価格表|金額)/.test(
+      String(lastUser)
+    );
+    if (needsContact) {
+      reply += `
 
 ---
 %%CTA_CONTACT%%`;
-  }
+    }
 
-  return NextResponse.json({ reply });
+    return NextResponse.json({ reply });
+  } catch (err: any) {
+    console.error("solution-chat api error:", err?.message || err);
+    const fallback =
+      "ただいま応答が不安定です。少し時間をおいて再度お試しください。必要であれば『無料相談フォーム』やお電話（06-6203-0222）もご利用いただけます。";
+    // 重要：常に JSON を返す（HTML 500/504 を避ける）
+    return NextResponse.json({ reply: fallback }, { status: 200 });
+  }
 }
